@@ -1,159 +1,124 @@
-CREATE TABLE rules_engine (
-    rule_id INT IDENTITY(1,1) PRIMARY KEY,
+ALTER TABLE rules_engine
+ADD 
+    short_description VARCHAR(255),
+    modifier VARCHAR(50);
 
-    NonFacFee_condition VARCHAR(50),
-    FacFee_condition VARCHAR(50),
-    Fee_Compare VARCHAR(20),
-    Codeid_condition VARCHAR(50),
 
-    specialtycode VARCHAR(20),
-
-    action_type VARCHAR(50),
-    action_value VARCHAR(100),
-
-    pos_list VARCHAR(200),
-
-    description VARCHAR(255),
-
-    -- ✅ NEW COLUMN (Rule Book - human readable)
-    rule_book VARCHAR(500),
-
-    comments VARCHAR(500) NULL,
-
-    created_at DATETIME DEFAULT GETDATE()
-);
-
-INSERT INTO rules_engine 
-(NonFacFee_condition, FacFee_condition, Fee_Compare, Codeid_condition, specialtycode,
- action_type, action_value, pos_list, description, rule_book, comments)
-VALUES
-
--- 1
-(NULL, NULL, NULL, 'CPT/HCPCS', '7170',
- 'LOAD', 'APPLY_SPECIALTY', NULL,
- 'Load specialty',
- 'For all CPT/HCPCS codes, assign specialty code 7170',
- NULL),
-
--- 2
-(NULL, NULL, NULL, '99001', '7170',
- 'FILTER', 'REMOVE', NULL,
- 'Remove code',
- 'If code is 99001, remove it from processing',
- NULL),
-
--- 3
-('IN(0,M,NA)', NULL, NULL, 'CPT/HCPCS', '7170',
- 'SKIP', 'DO_NOT_LOAD', NULL,
- 'Invalid NonFac',
- 'If Non-Facility Fee is 0 or M or NA, do not load the record',
- NULL),
-
--- 4
-(NULL, 'IN(0,M,NA)', NULL, 'CPT/HCPCS', '7170',
- 'SKIP', 'DO_NOT_LOAD', NULL,
- 'Invalid Fac',
- 'If Facility Fee is 0 or M or NA, do not load the record',
- NULL),
-
--- 5
-('NOT_EQUAL', 'NOT_EQUAL', 'NE', 'CPT/HCPCS', '0996',
- 'LOAD', 'LOAD_SPECIALTY_0996', NULL,
- 'Diff rates',
- 'If Non-Fac Fee and Fac Fee are different, assign specialty code 0996',
- NULL),
-
--- 6
-('HAS_VALUE', 'M_OR_NA', NULL, 'CPT/HCPCS', '7170',
- 'LOAD', 'BLANK_POS', NULL,
- 'NonFac present',
- 'If Non-Fac Fee has value and Fac Fee is M or NA, keep POS blank',
- NULL),
-
--- 7
-('NA', 'HAS_VALUE', NULL, 'CPT/HCPCS', '7170',
- 'LOAD', 'LOAD_POS', '19,21,22,23,24,31,34,61,62',
- 'Fac only',
- 'If only Fac Fee is present, load POS values: 19,21,22,23,24,31,34,61,62',
- NULL),
-
--- 8
-('NOT_EQUAL', 'NOT_EQUAL', 'NE', 'CPT/HCPCS', '7170',
- 'LOAD', 'LOAD_POS_WITH_FAC', '19,21,22,23,24,31,34,61,62',
- 'Diff rates POS',
- 'If Non-Fac and Fac fees are different, load POS list with Fac Fee',
- NULL);
+    UPDATE rules_engine
+SET 
+    short_description = 'FROM_CLAIM',
+    modifier = NULL;
 
 
 INSERT INTO rules_engine 
 (fee_id, flag, NonFacFee_condition, FacFee_condition, Fee_Compare, Codeid_condition, age_rule,
- specialtycode, action_type, action_value, pos_list, description, rule_book, comments)
+ specialtycode, action_type, action_value, pos_list, description, rule_book, comments,
+ short_description, modifier)
 VALUES
 
--- 1
 ('DV00052801','CNM', NULL, NULL, NULL, 'CPT/HCPCS', NULL,
  '8036', 'LOAD', 'APPLY_SPECIALTY', NULL,
- 'Load specialty',
- 'For CNM, assign specialty code 8036',
- NULL),
+ 'Load specialty','For CNM assign specialty 8036', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 2
 ('DV00052801','CNM', NULL, NULL, NULL, '99001', NULL,
  '8036', 'FILTER', 'REMOVE', NULL,
- 'Remove code',
- 'If code is 99001, remove it',
- NULL),
+ 'Remove code','Remove code 99001', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 3
 ('DV00052801','CNM', 'IN(0,M,NA)', NULL, NULL, 'CPT/HCPCS', NULL,
  '8036', 'SKIP', 'DO_NOT_LOAD', NULL,
- 'Invalid NonFac',
- 'If Non-Fac Fee is 0 or M or NA, do not load',
- NULL),
+ 'Invalid NonFac','Invalid Non-Fac Fee', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 4
 ('DV00052801','CNM', 'NOT_EQUAL', 'NOT_EQUAL', 'NE', 'CPT/HCPCS', NULL,
  '0996', 'LOAD', 'LOAD_SPECIALTY_0996', NULL,
- 'Diff rates',
- 'If fees differ, assign specialty 0996 and blank POS',
- NULL),
+ 'Diff rates','Assign 0996 if fees differ', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 5
 ('DV00052801','CNM', 'HAS_VALUE', 'M_OR_NA', NULL, 'CPT/HCPCS', NULL,
  '8036', 'LOAD', 'BLANK_POS', NULL,
- 'NonFac present',
- 'If Non-Fac exists and Fac is NA, keep POS blank',
- NULL),
+ 'NonFac present','NonFac exists → blank POS', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 6
 ('DV00052801','CNM', NULL, 'IN(0,M,NA)', NULL, 'CPT/HCPCS', NULL,
  '8036', 'SKIP', 'DO_NOT_LOAD', NULL,
- 'Invalid Fac',
- 'If Fac Fee is 0 or M or NA, do not load',
- NULL),
+ 'Invalid Fac','Invalid Fac Fee', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 7
 ('DV00052801','CNM', 'NA', 'HAS_VALUE', NULL, 'CPT/HCPCS', NULL,
  '8036', 'LOAD', 'LOAD_POS', '19,21,22,23,24,31,34,61,62',
- 'Fac only',
- 'If only Fac Fee exists, load POS list',
- NULL),
+ 'Fac only','Load POS if only Fac exists', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 8
 ('DV00052801','CNM', 'NOT_EQUAL', 'NOT_EQUAL', 'NE', 'CPT/HCPCS', NULL,
  '8036', 'LOAD', 'LOAD_POS_WITH_FAC', '19,21,22,23,24,31,34,61,62',
- 'Diff rates POS',
- 'If fees differ, load POS with Fac Fee',
- NULL),
+ 'Diff rates POS','Load POS with Fac Fee', NULL,
+ 'FROM_CLAIM', NULL),
 
--- 9
 ('DV00052801','CNM', NULL, NULL, NULL, 'CPT/HCPCS', 'AGE<=21',
  '8036', 'LOAD', 'ALLOW', NULL,
- 'Age rule',
- 'Only allow records where age is up to 21',
- NULL);
+ 'Age rule','Allow only age <= 21', NULL,
+ 'FROM_CLAIM', NULL);
 
- SELECT rule_id, fee_id, flag, NonFacFee_condition, FacFee_condition, action_value
-FROM rules_engine
-WHERE flag = 'CNM';
- 
+
+
+ INSERT INTO rules_engine 
+(fee_id, flag, NonFacFee_condition, FacFee_condition, Fee_Compare, Codeid_condition, age_rule,
+ specialtycode, action_type, action_value, pos_list, description, rule_book, comments,
+ short_description, modifier)
+VALUES
+
+-- 1. Default specialty
+('DV00052801','ORAL', NULL, NULL, NULL, 'CPT/HCPCS', NULL,
+ 'ORAL', 'LOAD', 'APPLY_SPECIALTY', NULL,
+ 'Load specialty','Apply ORAL specialty mapping', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 2. Remove code 99001
+('DV00052801','ORAL', NULL, NULL, NULL, '99001', NULL,
+ 'ORAL', 'FILTER', 'REMOVE', NULL,
+ 'Remove code','Remove CPT code 99001', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 3. Invalid NonFacFee
+('DV00052801','ORAL', 'IN(0,M,NA)', NULL, NULL, 'CPT/HCPCS', NULL,
+ 'ORAL', 'SKIP', 'DO_NOT_LOAD', NULL,
+ 'Invalid NonFac','Skip if Non-Fac Fee is 0/M/NA', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 4. Different rates → specialty 0996 + blank POS
+('DV00052801','ORAL', 'NOT_EQUAL', 'NOT_EQUAL', 'NE', 'CPT/HCPCS', NULL,
+ '0996', 'LOAD', 'LOAD_SPECIALTY_0996', NULL,
+ 'Diff rates','If fees differ → assign specialty 0996 and blank POS', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 5. NonFac present, Fac NA → blank POS
+('DV00052801','ORAL', 'HAS_VALUE', 'M_OR_NA', NULL, 'CPT/HCPCS', NULL,
+ 'ORAL', 'LOAD', 'BLANK_POS', NULL,
+ 'NonFac present','If NonFac exists and Fac is M/NA → blank POS', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 6. Invalid FacFee
+('DV00052801','ORAL', NULL, 'IN(0,M,NA)', NULL, 'CPT/HCPCS', NULL,
+ 'ORAL', 'SKIP', 'DO_NOT_LOAD', NULL,
+ 'Invalid Fac','Skip if Fac Fee is 0/M/NA', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 7. Fac only → POS + specialty 0996
+('DV00052801','ORAL', 'NA', 'HAS_VALUE', NULL, 'CPT/HCPCS', NULL,
+ '0996', 'LOAD', 'LOAD_POS', '19,21,22,23,24,31,34,61,62',
+ 'Fac only','If only Fac Fee exists → load POS and specialty 0996', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 8. Different rates → POS with Fac Fee
+('DV00052801','ORAL', 'NOT_EQUAL', 'NOT_EQUAL', 'NE', 'CPT/HCPCS', NULL,
+ 'ORAL', 'LOAD', 'LOAD_POS_WITH_FAC', '19,21,22,23,24,31,34,61,62',
+ 'Diff rates POS','If fees differ → load POS with Fac Fee', NULL,
+ 'FROM_CLAIM', NULL),
+
+-- 9. Age rule
+('DV00052801','ORAL', NULL, NULL, NULL, 'CPT/HCPCS', 'AGE<19_OR_CSHCS',
+ 'ORAL', 'SKIP', 'DO_NOT_LOAD', NULL,
+ 'Age rule','Reject if age < 19 or CSHCS-only case', NULL,
+ 'FROM_CLAIM', NULL);

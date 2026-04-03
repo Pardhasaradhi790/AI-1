@@ -45,6 +45,10 @@ from config import (
 )
 
 
+# ────────────────────────── constants ────────────────────────
+
+DATA_RETENTION_DAYS = 365  # fee_schedule_data rows older than this are purged
+
 # ────────────────────────── helpers ──────────────────────────
 
 
@@ -62,13 +66,31 @@ def get_db_connection():
 
 
 def is_already_downloaded(conn, fee_id: str, primary_fs: str,
-                          fs_segment: str, file_url: str) -> bool:
-    """Return True when this fee_id + primary_fs + fs_segment + file_url combo exists."""
+                          fs_segment: str, file_url: str,
+                          file_name: str = "") -> bool:
+    """
+    Return True when this file was already handled for the same
+    fee_id + primary_fs + fs_segment.
+
+    We check both URL and filename so the scraper does not reload the same
+    file into the DB when it has already been processed for that segment.
+    """
     cursor = conn.cursor()
+
     cursor.execute(
-        "SELECT 1 FROM dbo.downloaded_files "
-        "WHERE fee_id = ? AND primary_fs = ? AND fs_segment = ? AND file_url = ?",
-        fee_id, primary_fs, fs_segment, file_url,
+        "SELECT TOP 1 1 FROM dbo.downloaded_files "
+        "WHERE fee_id = ? AND primary_fs = ? AND fs_segment = ? "
+        "AND (file_url = ? OR (? <> '' AND file_name = ?))",
+        fee_id, primary_fs, fs_segment, file_url, file_name, file_name,
+    )
+    if cursor.fetchone() is not None:
+        return True
+
+    cursor.execute(
+        "SELECT TOP 1 1 FROM dbo.extraction_metadata "
+        "WHERE fee_id = ? AND primary_fs = ? AND fs_segment = ? "
+        "AND (file_url = ? OR (? <> '' AND file_name = ?))",
+        fee_id, primary_fs, fs_segment, file_url, file_name, file_name,
     )
     return cursor.fetchone() is not None
 
@@ -226,16 +248,71 @@ MONTH_MAP = {
 }
 
 
-def parse_file_date(label: str):
-    """Try to extract a (year, month) from text like 'Jan 2026 XLSX'."""
-    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
-                  r"january|february|march|april|june|july|august|"
-                  r"september|october|november|december)\s+(\d{4})",
-                  label, re.IGNORECASE)
-    if m:
-        month = MONTH_MAP[m.group(1).lower()]
-        year = int(m.group(2))
-        return datetime(year, month, 1)
+def parse_file_date(text: str):
+    """
+    Extract date information from a label or filename.
+
+    Supported patterns include:
+      - 'Jan 2026' / 'January 2026'
+      - '012026', '01-2026', '01_2026'
+      - '2026-01', '202601'
+      - year-only strings such as 'SFY_2026'
+    """
+    text = text or ""
+
+    month_name_match = re.search(
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+        r"january|february|march|april|june|july|august|"
+        r"september|october|november|december)\s+(\d{4})",
+        text,
+        re.IGNORECASE,
+    )
+    if month_name_match:
+        month = MONTH_MAP[month_name_match.group(1).lower()]
+        year = int(month_name_match.group(2))
+        return {
+            "year": year,
+            "month": month,
+            "has_month": True,
+            "date": datetime(year, month, 1),
+            "display": datetime(year, month, 1).strftime("%B %Y"),
+        }
+
+    month_first_match = re.search(r"(?<!\d)(0?[1-9]|1[0-2])[-_/ ]?(20\d{2})(?!\d)", text)
+    if month_first_match:
+        month = int(month_first_match.group(1))
+        year = int(month_first_match.group(2))
+        return {
+            "year": year,
+            "month": month,
+            "has_month": True,
+            "date": datetime(year, month, 1),
+            "display": datetime(year, month, 1).strftime("%B %Y"),
+        }
+
+    year_first_match = re.search(r"(?<!\d)(20\d{2})[-_/ ]?(0?[1-9]|1[0-2])(?!\d)", text)
+    if year_first_match:
+        year = int(year_first_match.group(1))
+        month = int(year_first_match.group(2))
+        return {
+            "year": year,
+            "month": month,
+            "has_month": True,
+            "date": datetime(year, month, 1),
+            "display": datetime(year, month, 1).strftime("%B %Y"),
+        }
+
+    year_only_match = re.search(r"(?<!\d)(20\d{2})(?!\d)", text)
+    if year_only_match:
+        year = int(year_only_match.group(1))
+        return {
+            "year": year,
+            "month": None,
+            "has_month": False,
+            "date": datetime(year, 1, 1),
+            "display": str(year),
+        }
+
     return None
 
 
@@ -248,34 +325,103 @@ def is_pdf_link(url: str) -> bool:
     return urlparse(url).path.lower().endswith(".pdf")
 
 
+def _is_current_quarter(date_info: dict, today: datetime = None) -> bool:
+    """Return True when the parsed month/year belongs to the current quarter."""
+    if not date_info or not date_info.get("has_month"):
+        return False
+
+    today = today or datetime.utcnow()
+    current_quarter = ((today.month - 1) // 3) + 1
+    entry_quarter = ((date_info["month"] - 1) // 3) + 1
+    return date_info["year"] == today.year and entry_quarter == current_quarter
+
+
+def _choose_preferred_entry(items: list[dict]):
+    """Prefer Excel for the same release; otherwise keep the first listed item."""
+    if not items:
+        return None
+
+    excels = [item for item in items if is_excel_link(item["url"])]
+    if excels:
+        return excels[0]
+
+    pdfs = [item for item in items if is_pdf_link(item["url"])]
+    if pdfs:
+        return pdfs[0]
+
+    return items[0]
+
+
+def _is_instruction_like(label: str) -> bool:
+    label_lower = (label or "").lower()
+    return "instruction" in label_lower or "instructions" in label_lower
+
+
 def classify_entries(entries: list[dict]) -> list[dict]:
     """
-    Given a list of {'label', 'url'} dicts, group by quarter date.
-    For each quarter:
-      - If both PDF and Excel exist, keep only the Excel.
-      - If only PDF exists (no Excel), keep the PDF.
-    Skip non-date entries like "Database Instructions".
-    Returns a list of {'label', 'url', 'date'} dicts sorted newest-first.
-    """
-    by_date: dict[datetime, list[dict]] = {}
-    for e in entries:
-        dt = parse_file_date(e["label"])
-        if dt is None:
-            continue  # "Database Instructions" etc.
-        by_date.setdefault(dt, []).append(e)
+    Choose only the newest eligible file for a section.
 
-    result = []
-    for dt in sorted(by_date, reverse=True):
-        items = by_date[dt]
-        excels = [i for i in items if is_excel_link(i["url"])]
-        if excels:
-            result.append({**excels[0], "date": dt})
-        else:
-            # No Excel for this quarter – fall back to PDF
-            pdfs = [i for i in items if is_pdf_link(i["url"])]
-            if pdfs:
-                result.append({**pdfs[0], "date": dt})
-    return result
+    Rules:
+      - Prefer Excel over PDF for the same release.
+      - If a file exists in the current quarter, keep the latest month there.
+      - Otherwise keep the latest month within the latest year.
+      - If only a year is present, keep the latest year.
+      - If no date exists, fall back to the first non-instruction file.
+
+    Returns a list with at most one item.
+    """
+    dated_groups: dict[tuple, list[dict]] = {}
+    undated_entries = []
+
+    for position, entry in enumerate(entries):
+        candidate = {**entry, "position": position}
+        date_info = parse_file_date(
+            f"{entry.get('label', '')} {filename_from_url(entry.get('url', ''))}"
+        )
+
+        if date_info is None:
+            if not _is_instruction_like(entry.get("label", "")):
+                undated_entries.append(candidate)
+            continue
+
+        candidate["date_info"] = date_info
+        candidate["date"] = date_info["date"]
+        candidate["date_display"] = date_info["display"]
+        key = (date_info["year"], date_info["month"] or 0, date_info["has_month"])
+        dated_groups.setdefault(key, []).append(candidate)
+
+    dated_entries = []
+    for group_items in dated_groups.values():
+        chosen = _choose_preferred_entry(group_items)
+        if chosen:
+            dated_entries.append(chosen)
+
+    if dated_entries:
+        current_quarter_entries = [e for e in dated_entries if _is_current_quarter(e["date_info"])]
+        pool = current_quarter_entries or dated_entries
+        latest = max(
+            pool,
+            key=lambda e: (
+                e["date_info"]["year"],
+                e["date_info"]["month"] or 0,
+                1 if e["date_info"]["has_month"] else 0,
+            ),
+        )
+        latest["selection_reason"] = (
+            "latest file in the current quarter"
+            if current_quarter_entries else
+            "latest available file"
+        )
+        return [latest]
+
+    fallback = _choose_preferred_entry(undated_entries)
+    if fallback:
+        fallback["date"] = None
+        fallback["date_display"] = None
+        fallback["selection_reason"] = "latest undated file"
+        return [fallback]
+
+    return []
 
 
 def heading_to_folder(heading: str) -> str:
@@ -416,53 +562,61 @@ def navigate_to_page_via_search(page: Page, search_term: str):
     link_count = all_links.count()
     print(f"[DEBUG] Found {link_count} links in #content")
 
-    matched_link = None
+    # ── Collect all link texts and hrefs once to avoid repeated DOM queries ──
+    all_link_data = []
     for i in range(link_count):
         txt = all_links.nth(i).inner_text(timeout=3000).strip()
         href = all_links.nth(i).get_attribute("href") or ""
         if txt:
             print(f"  [{i}] {txt!r}  →  {href}")
-        if (txt and txt.lower() == search_term.lower()
-                and href.startswith("http")
-                and "billingreimbursement" in href):
-            matched_link = all_links.nth(i)
-            print(f"[+] Matched result link: {txt!r} → {href}")
+        all_link_data.append({"index": i, "text": txt, "href": href})
+
+    matched_link = None
+    st_lower = search_term.lower()
+
+    def _text_match(txt_lower, exact=True):
+        if exact:
+            return txt_lower == st_lower
+        return st_lower in txt_lower or txt_lower in st_lower
+
+    # Priority order — billing URLs are always tried before non-billing:
+    #   1. Exact text  + billingreimbursement
+    #   2. Partial text + billingreimbursement
+    #   3. Any billingreimbursement link on michigan.gov/mdhhs
+    #   4. Exact text  (any href)
+    #   5. Partial text (any href)
+    #   6. Any michigan.gov/mdhhs link
+    fallback_chain = [
+        ("exact text + billing",   True,  True),
+        ("partial text + billing", False, True),
+        ("any billing link",       None,  True),
+        ("exact text",             True,  False),
+        ("partial text",           False, False),
+        ("any mdhhs link",         None,  False),
+    ]
+
+    for label, exact, require_billing in fallback_chain:
+        if matched_link is not None:
             break
-
-    # Fallback 1: exact text match (any href)
-    if matched_link is None:
-        for i in range(link_count):
-            txt = all_links.nth(i).inner_text(timeout=3000).strip()
-            href = all_links.nth(i).get_attribute("href") or ""
-            if txt and txt.lower() == search_term.lower() and href.startswith("http"):
-                matched_link = all_links.nth(i)
-                print(f"[+] Matched result link (exact text): {txt!r} → {href}")
-                break
-
-    if matched_link is None:
-        # Fallback: find a link that contains the search term (or vice versa)
-        for i in range(link_count):
-            txt = all_links.nth(i).inner_text(timeout=3000).strip()
-            href = all_links.nth(i).get_attribute("href") or ""
+        for ld in all_link_data:
+            txt, href = ld["text"], ld["href"]
             if not txt or not href.startswith("http"):
                 continue
-            st_lower = search_term.lower()
-            txt_lower = txt.lower()
-            if st_lower in txt_lower or txt_lower in st_lower:
-                matched_link = all_links.nth(i)
-                print(f"[+] Partial-match result link: {txt!r} → {href}")
-                break
-
-    if matched_link is None:
-        # Last resort: pick the first michigan.gov/mdhhs link that isn't a PDF/doc
-        for i in range(link_count):
-            txt = all_links.nth(i).inner_text(timeout=3000).strip()
-            href = all_links.nth(i).get_attribute("href") or ""
-            if (txt and "michigan.gov/mdhhs" in href
-                    and not href.endswith((".pdf", ".dotx", ".docx"))):
-                matched_link = all_links.nth(i)
-                print(f"[+] Best-guess result link: {txt!r} → {href}")
-                break
+            # Text check
+            if exact is not None and not _text_match(txt.lower(), exact=exact):
+                continue
+            # Billing check
+            if require_billing and "billingreimbursement" not in href:
+                continue
+            # For the "any link" fallbacks, require michigan.gov/mdhhs domain
+            if exact is None and "michigan.gov/mdhhs" not in href:
+                continue
+            # Skip PDFs / docs for the "any link" fallbacks
+            if exact is None and href.endswith((".pdf", ".dotx", ".docx")):
+                continue
+            matched_link = all_links.nth(ld["index"])
+            print(f"[+] Matched ({label}): {txt!r} → {href}")
+            break
 
     if matched_link is None:
         raise RuntimeError(
@@ -479,21 +633,89 @@ def navigate_to_page_via_search(page: Page, search_term: str):
 # ────────────────────────── Section discovery ──────────────────────────
 
 
-def discover_sections(page: Page) -> list[dict]:
+def discover_sections(page: Page, allowed_segments: set[str] | None = None) -> list[dict]:
     """
     Auto-discover all fee-schedule dropdown sections on the current page.
-    Returns a list of {'heading': str, 'folder': str} dicts.
+
+    Handles three page layouts:
+      A) The wrapper has a non-empty <h3> heading (e.g. "Anesthesia").
+      B) The <h3> is empty and the section name appears in the nearest
+         preceding <p><strong> element (e.g. "Federally Qualified Health
+         Center (FQHC)").
+      C) The <h3> is empty, there is no preceding <strong>, and the page
+         has only a bare dropdown (e.g. "Maternal Infant Health Program").
+         In this case the wrapper is returned with heading='' so the
+         caller can assign the segment name from the master Excel.
+
+    *allowed_segments* (optional) is the set of FS Segment names from the
+    master Excel.  When a wrapper has no discoverable heading and there is
+    exactly one wrapper on the page, the first allowed segment is used as
+    the heading.
+
+    Returns a list of {'heading': str, 'folder': str, 'wrapper_index': int}
+    dicts.  wrapper_index is used later by scrape_section to target the
+    correct dropdown without ambiguity.
     """
-    headings = page.locator("div.link-list-dropdown h3")
-    count = headings.count()
+    wrappers = page.locator("div.wrapper-quicklist")
+    count = wrappers.count()
     sections = []
+    unnamed_wrappers = []
+
     for i in range(count):
-        text = headings.nth(i).inner_text().strip()
-        if text:
+        wrapper = wrappers.nth(i)
+
+        # Try the <h3> inside the wrapper first (Layout A).
+        h3 = wrapper.locator("h3")
+        heading = ""
+        if h3.count() > 0:
+            heading = h3.first.inner_text().strip()
+
+        # Layout B: empty <h3> — look for the nearest preceding <strong>
+        # inside a rich-text component.
+        if not heading:
+            heading = wrapper.evaluate(
+                """el => {
+                    // Walk backwards through preceding siblings / parent
+                    // siblings to find the closest <strong> text.
+                    let node = el.closest('.link-list-dropdown');
+                    while (node) {
+                        node = node.previousElementSibling;
+                        if (!node) break;
+                        const strong = node.querySelector('strong');
+                        if (strong && strong.textContent.trim()) {
+                            return strong.textContent.trim();
+                        }
+                    }
+                    return '';
+                }"""
+            )
+
+        if heading:
             sections.append({
-                "heading": text,
-                "folder": heading_to_folder(text),
+                "heading": heading,
+                "folder": heading_to_folder(heading),
+                "wrapper_index": i,
             })
+        else:
+            # Layout C: no heading at all — remember the wrapper index
+            unnamed_wrappers.append(i)
+
+    # Layout C fallback: assign allowed segment names to unnamed wrappers
+    # in order. This handles pages with bare dropdown(s) and no headings.
+    if unnamed_wrappers and allowed_segments:
+        unmatched = sorted(allowed_segments - {s["heading"] for s in sections})
+        for idx, wrapper_i in enumerate(unnamed_wrappers):
+            if idx < len(unmatched):
+                seg_name = unmatched[idx]
+            else:
+                seg_name = f"Unnamed Section {wrapper_i + 1}"
+            sections.append({
+                "heading": seg_name,
+                "folder": heading_to_folder(seg_name),
+                "wrapper_index": wrapper_i,
+            })
+            print(f"  [INFO] Unnamed dropdown #{wrapper_i} assigned heading: '{seg_name}'")
+
     print(f"[+] Discovered {len(sections)} section(s): {[s['heading'] for s in sections]}")
     return sections
 
@@ -504,12 +726,15 @@ def discover_sections(page: Page) -> list[dict]:
 def scrape_section(page: Page, section_heading: str, folder_name: str,
                    conn, download_dir: str,
                    fee_id: str = "", primary_fs: str = "",
-                   fs_segment: str = "", direct_link: str = ""):
+                   fs_segment: str = "", direct_link: str = "",
+                   wrapper_index: int | None = None):
     """
-    Process one <h3> section: open dropdown, collect links, download ALL
-    quarter files that are not already in the database.
-    For each quarter: prefer Excel over PDF; if no Excel, download PDF.
-    Preserves original filenames. Stores metadata alongside each record.
+    Process one dropdown section: open it, collect links, download the
+    latest eligible file that is not already in the database.
+
+    *wrapper_index* (from discover_sections) targets the exact
+    div.wrapper-quicklist on the page, avoiding ambiguity when the <h3>
+    is empty.
     """
     print(f"\n{'='*60}")
     print(f"  Section: {section_heading}")
@@ -519,18 +744,29 @@ def scrape_section(page: Page, section_heading: str, folder_name: str,
     parsed = urlparse(page.url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
 
-    # Find the <h3> that contains the section heading text
-    # Escape single quotes in heading to avoid CSS selector breakage
-    escaped_heading = section_heading.replace("'", "\\'")
-    h3_locator = page.locator(
-        f"div.link-list-dropdown h3:text-is('{escaped_heading}')"
-    )
-    if h3_locator.count() == 0:
-        print(f"  [!] Could not find heading '{section_heading}' – skipping.")
-        return
+    # ── Locate the dropdown wrapper ──
+    wrapper = None
 
-    # The dropdown wrapper is a sibling after h3 inside the same parent
-    wrapper = h3_locator.locator("xpath=ancestor::div[contains(@class,'wrapper-quicklist')]")
+    # Preferred: use the wrapper_index captured during discovery
+    if wrapper_index is not None:
+        all_wrappers = page.locator("div.wrapper-quicklist")
+        if wrapper_index < all_wrappers.count():
+            wrapper = all_wrappers.nth(wrapper_index)
+
+    # Fallback: search by <h3> text (original method)
+    if wrapper is None:
+        escaped_heading = section_heading.replace("'", "\\'")
+        h3_locator = page.locator(
+            f"div.link-list-dropdown h3:text-is('{escaped_heading}')"
+        )
+        if h3_locator.count() > 0:
+            wrapper = h3_locator.locator(
+                "xpath=ancestor::div[contains(@class,'wrapper-quicklist')]"
+            )
+
+    if wrapper is None or wrapper.count() == 0:
+        print(f"  [!] Could not find dropdown for '{section_heading}' – skipping.")
+        return
 
     # Click the dropdown button to open it
     dd_button = wrapper.locator("button.dd-title-button")
@@ -557,18 +793,12 @@ def scrape_section(page: Page, section_heading: str, folder_name: str,
         dd_button.click()
         return
 
-    # Get one file per quarter (Excel preferred, PDF fallback)
+    # Keep only the newest eligible file for this section.
     to_download = classify_entries(entries)
-
-    # Also collect undated entries (e.g. standalone PDFs with no quarter date)
-    dated_urls = {e["url"] for e in to_download}
-    undated = [e for e in entries if e["url"] not in dated_urls]
-    if undated:
-        for u in undated:
-            to_download.append({**u, "date": None})
-        print(f"  {len(to_download)} file(s) to process ({len(undated)} undated).")
-    elif to_download:
-        print(f"  {len(to_download)} quarter file(s) available.")
+    if to_download:
+        chosen = to_download[0]
+        reason = chosen.get("selection_reason", "latest available file")
+        print(f"  {len(to_download)} file selected ({reason}).")
     else:
         print("  [!] No downloadable entries – skipping.")
         dd_button.click()
@@ -591,14 +821,15 @@ def scrape_section(page: Page, section_heading: str, folder_name: str,
         fname = filename_from_url(file_url)
         local_path = os.path.join(section_dir, fname)
 
-        # Check if already in DB – skip if so
-        if is_already_downloaded(conn, fee_id, primary_fs, fs_segment, file_url):
-            print(f"    [SKIP] {file_label} – already in DB.")
+        # Check if already in DB / metadata for this same Primary FS + segment.
+        if is_already_downloaded(conn, fee_id, primary_fs, fs_segment, file_url, fname):
+            print(f"    [SKIP] {file_label} – already processed for this segment.")
             skipped_count += 1
             continue
 
         # Download the file
-        date_str = f" ({file_date:%B %Y})" if file_date else ""
+        date_label = entry.get("date_display")
+        date_str = f" ({date_label})" if date_label else ""
         print(f"    Downloading {file_label}{date_str} → {fname}")
         response = page.request.get(file_url)
         if not response.ok:
@@ -641,6 +872,26 @@ def scrape_section(page: Page, section_heading: str, folder_name: str,
     dd_button.click()
 
 
+def purge_expired_data(conn, retention_days: int = DATA_RETENTION_DAYS):
+    """
+    Delete rows from fee_schedule_data whose loaded_at is older than
+    *retention_days* days.  Metadata tables are NOT touched.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM dbo.fee_schedule_data "
+        "WHERE loaded_at < DATEADD(DAY, ?, SYSUTCDATETIME())",
+        -retention_days,
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    if deleted:
+        print(f"[+] Purged {deleted:,} expired row(s) from fee_schedule_data "
+              f"(older than {retention_days} days).")
+    else:
+        print(f"[+] No expired fee_schedule_data rows to purge.")
+
+
 def main():
     print("Michigan MDHHS Fee Schedule Scraper (Excel-driven)")
     print("=" * 60)
@@ -657,6 +908,9 @@ def main():
     # Connect to SQL Server
     conn = get_db_connection()
     print("[+] Connected to SQL Server.")
+
+    # Purge fee_schedule_data rows older than 1 year
+    purge_expired_data(conn)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=HEADLESS)
@@ -686,11 +940,21 @@ def main():
             navigate_to_page_via_search(page, primary_fs)
 
             # Discover all dropdown sections on the page
-            all_sections = discover_sections(page)
+            all_sections = discover_sections(page, allowed_segments)
+
+            # Build a normalised lookup for fuzzy segment matching.
+            # Pages may use &nbsp; or other whitespace variants that differ
+            # from the master Excel text.
+            def _normalise(s: str) -> str:
+                return re.sub(r"\s+", " ", s.strip().lower())
+
+            norm_allowed = {_normalise(seg): seg for seg in allowed_segments}
 
             # Filter to only the FS Segments from the master Excel
             for sec in all_sections:
-                if sec["heading"] not in allowed_segments:
+                norm_heading = _normalise(sec["heading"])
+                matched_segment = norm_allowed.get(norm_heading)
+                if matched_segment is None:
                     print(f"\n  [SKIP] '{sec['heading']}' – not in master Excel segments.")
                     continue
 
@@ -700,8 +964,9 @@ def main():
                         conn, DOWNLOAD_ROOT,
                         fee_id=fee_id,
                         primary_fs=primary_fs,
-                        fs_segment=sec["heading"],
+                        fs_segment=matched_segment,
                         direct_link=page.url,
+                        wrapper_index=sec.get("wrapper_index"),
                     )
                 except Exception as exc:
                     print(f"  [ERR] Section '{sec['heading']}' failed: {exc}")

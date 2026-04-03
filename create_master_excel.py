@@ -77,4 +77,3 @@ with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
     worksheet.set_column("C:C", 50)
 
 print(f"Created: {output}")
-
